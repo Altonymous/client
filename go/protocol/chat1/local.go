@@ -5,6 +5,7 @@ package chat1
 
 import (
 	"errors"
+
 	gregor1 "github.com/keybase/client/go/protocol/gregor1"
 	keybase1 "github.com/keybase/client/go/protocol/keybase1"
 	stellar1 "github.com/keybase/client/go/protocol/stellar1"
@@ -5342,6 +5343,24 @@ func (o ClearBotCommandsLocalRes) DeepCopy() ClearBotCommandsLocalRes {
 			}
 			return ret
 		})(o.RateLimits),
+	}
+}
+
+type ChatChannel struct {
+	Name        string `codec:"name" json:"name"`
+	Public      bool   `codec:"public" json:"public"`
+	MembersType string `codec:"membersType" json:"membersType"`
+	TopicType   string `codec:"topicType" json:"topicType"`
+	TopicName   string `codec:"topicName" json:"topicName"`
+}
+
+func (o ChatChannel) DeepCopy() ChatChannel {
+	return ChatChannel{
+		Name:        o.Name,
+		Public:      o.Public,
+		MembersType: o.MembersType,
+		TopicType:   o.TopicType,
+		TopicName:   o.TopicName,
 	}
 }
 
