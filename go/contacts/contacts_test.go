@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/keybase/client/go/libkb"
 	"github.com/keybase/client/go/protocol/keybase1"
@@ -38,22 +39,24 @@ func makeProvider(t *testing.T) *MockContactsProvider {
 }
 
 func (c *MockContactsProvider) LookupAll(mctx libkb.MetaContext, emails []keybase1.EmailAddress,
-	numbers []keybase1.RawPhoneNumber, userRegion keybase1.RegionCode) (ContactLookupMap, error) {
+	numbers []keybase1.RawPhoneNumber, userRegion keybase1.RegionCode) (ContactLookupResults, error) {
 
-	ret := make(ContactLookupMap)
+	ret := NewContactLookupResults()
 	for _, email := range emails {
 		if user, found := c.emails[email]; found {
-			ret[fmt.Sprintf("e:%s", string(email))] = ContactLookupResult{UID: user.UID}
+			ret.Results[fmt.Sprintf("e:%s", string(email))] = ContactLookupResult{UID: user.UID}
 		}
 	}
 	for _, number := range numbers {
 		if user, found := c.phoneNumbers[number]; found {
-			ret[fmt.Sprintf("p:%s", string(number))] = ContactLookupResult{UID: user.UID}
+			ret.Results[fmt.Sprintf("p:%s", string(number))] = ContactLookupResult{UID: user.UID}
 		}
 		if errStr, found := c.phoneNumberErrors[number]; found {
-			ret[fmt.Sprintf("p:%s", string(number))] = ContactLookupResult{Error: errStr}
+			ret.Results[fmt.Sprintf("p:%s", string(number))] = ContactLookupResult{Error: errStr}
 		}
 	}
+	ret.ResolvedFreshness = 10 * 24 * time.Hour  // approx 10 days
+	ret.UnresolvedFreshness = 1 * 24 * time.Hour // approx one day
 	return ret, nil
 }
 
@@ -98,10 +101,9 @@ type ErrorContactsProvider struct {
 }
 
 func (c *ErrorContactsProvider) LookupAll(mctx libkb.MetaContext, emails []keybase1.EmailAddress,
-	numbers []keybase1.RawPhoneNumber, userRegion keybase1.RegionCode) (ret ContactLookupMap, err error) {
+	numbers []keybase1.RawPhoneNumber, userRegion keybase1.RegionCode) (ret ContactLookupResults, err error) {
 	c.t.Errorf("Call to ErrorContactsProvider.LookupAll")
-	err = errors.New("error contacts provider")
-	return
+	return ret, errors.New("error contacts provider")
 }
 
 func (c *ErrorContactsProvider) FillUsernames(libkb.MetaContext, []keybase1.ProcessedContact) {

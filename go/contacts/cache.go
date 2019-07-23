@@ -53,8 +53,8 @@ var _ ContactsProvider = (*CachedContactsProvider)(nil)
 
 type cachedLookupResult struct {
 	ContactLookupResult
-	Resolved bool
-	CachedAt time.Time
+	Resolved  bool
+	ExpiresAt time.Time
 }
 
 type lookupResultCache struct {
@@ -75,34 +75,26 @@ func makeNewLookupResultCache() (ret lookupResultCache) {
 }
 
 const cacheCurrentMajorVersion = 1
-const cacheCurrentMinorVersion = 0
+const cacheCurrentMinorVersion = 1
 
-func cachedResultFromLookupResult(v ContactLookupResult, now time.Time) cachedLookupResult {
+func cachedResultFromLookupResult(v ContactLookupResult, expires time.Time) cachedLookupResult {
 	return cachedLookupResult{
 		ContactLookupResult: v,
 		Resolved:            true,
-		CachedAt:            now,
+		ExpiresAt:           expires,
 	}
-}
-
-const contactCacheFreshness = 30 * 24 * time.Hour      // approx a month
-const unresolvedContactCacheFreshness = 24 * time.Hour // approx a day
-
-func (c cachedLookupResult) getFreshness() time.Duration {
-	if c.Resolved {
-		return contactCacheFreshness
-	}
-	return unresolvedContactCacheFreshness
 }
 
 func (c *lookupResultCache) findFreshOrSetEmpty(mctx libkb.MetaContext, key string) (res cachedLookupResult, found bool) {
-	clock := mctx.G().Clock()
+	now := mctx.G().Clock().Now()
 	res, found = c.Lookups[key]
-	if !found || clock.Since(res.CachedAt) > res.getFreshness() {
-		// Pre-insert to the cache. If Provider.LookupAll does not find
-		// these, they will stay in the cache as unresolved, otherwise they
-		// are overwritten.
-		res = cachedLookupResult{Resolved: false, CachedAt: clock.Now()}
+	if !found || now.After(res.ExpiresAt) {
+		// Pre-insert to the cache. If Provider.LookupAll does not find these,
+		// they will stay in the cache as unresolved, otherwise they are
+		// overwritten.
+
+		// Caller is supposed to set proper ExpiresAt value.
+		res = cachedLookupResult{Resolved: false, ExpiresAt: now}
 		c.Lookups[key] = res
 		return res, false
 	}
@@ -110,26 +102,24 @@ func (c *lookupResultCache) findFreshOrSetEmpty(mctx libkb.MetaContext, key stri
 }
 
 func (c *lookupResultCache) cleanup(mctx libkb.MetaContext) {
-	clock := mctx.G().Clock()
+	now := mctx.G().Clock().Now()
 	for key, val := range c.Lookups {
-		if clock.Since(val.CachedAt) > val.getFreshness() {
+		if now.After(val.ExpiresAt) {
 			delete(c.Lookups, key)
 		}
 	}
 }
 
 func (c *CachedContactsProvider) LookupAll(mctx libkb.MetaContext, emails []keybase1.EmailAddress,
-	numbers []keybase1.RawPhoneNumber, userRegion keybase1.RegionCode) (res ContactLookupMap, err error) {
+	numbers []keybase1.RawPhoneNumber, userRegion keybase1.RegionCode) (res ContactLookupResults, err error) {
 
 	defer mctx.TraceTimed(fmt.Sprintf("CachedContactsProvider#LookupAll(len=%d)", len(emails)+len(numbers)),
 		func() error { return nil })()
 
-	res = make(ContactLookupMap)
+	res = NewContactLookupResults()
 	if len(emails)+len(numbers) == 0 {
 		return res, nil
 	}
-
-	now := mctx.G().Clock().Now()
 
 	// This is a rather long-lived lock, because normally it will be held
 	// through the entire duration of the lookup, but:
@@ -152,19 +142,26 @@ func (c *CachedContactsProvider) LookupAll(mctx libkb.MetaContext, emails []keyb
 		conCache = makeNewLookupResultCache()
 	} else {
 		mctx.Debug("Fetched cache, current cache size: %d", len(conCache.Lookups))
+		conCache.Version.Major = cacheCurrentMajorVersion
+		conCache.Version.Minor = cacheCurrentMinorVersion
 	}
 
 	var remainingEmails []keybase1.EmailAddress
 	var remainingNumbers []keybase1.RawPhoneNumber
 
+	// Map of keys of new unresolved cache entries, to set ExpireAt value after
+	// we do parent provider LookupAll call.
+	newUnresolvedEntries := make(map[string]struct{})
+
 	for _, v := range emails {
 		key := makeEmailLookupKey(v)
 		if cache, found := conCache.findFreshOrSetEmpty(mctx, key); found {
 			if cache.Resolved {
-				res[key] = cache.ContactLookupResult
+				res.Results[key] = cache.ContactLookupResult
 			}
 		} else {
 			remainingEmails = append(remainingEmails, v)
+			newUnresolvedEntries[key] = struct{}{}
 		}
 	}
 
@@ -172,10 +169,11 @@ func (c *CachedContactsProvider) LookupAll(mctx libkb.MetaContext, emails []keyb
 		key := makePhoneLookupKey(v)
 		if cache, found := conCache.findFreshOrSetEmpty(mctx, key); found {
 			if cache.Resolved {
-				res[key] = cache.ContactLookupResult
+				res.Results[key] = cache.ContactLookupResult
 			}
 		} else {
 			remainingNumbers = append(remainingNumbers, v)
+			newUnresolvedEntries[key] = struct{}{}
 		}
 	}
 
@@ -184,9 +182,21 @@ func (c *CachedContactsProvider) LookupAll(mctx libkb.MetaContext, emails []keyb
 	if len(remainingEmails)+len(remainingNumbers) > 0 {
 		apiRes, err := c.Provider.LookupAll(mctx, remainingEmails, remainingNumbers, userRegion)
 		if err == nil {
-			for k, v := range apiRes {
-				res[k] = v
-				conCache.Lookups[k] = cachedResultFromLookupResult(v, now)
+			now := mctx.G().Clock().Now()
+			expiresAt := now.Add(apiRes.ResolvedFreshness)
+			for k, v := range apiRes.Results {
+				res.Results[k] = v
+				conCache.Lookups[k] = cachedResultFromLookupResult(v, expiresAt)
+			}
+			// Loop through entries that we asked for and find these we did not get
+			// resolutions for. Set ExpiresAt now that we know UnresolvedFreshness.
+			unresolvedExpiresAt := now.Add(apiRes.UnresolvedFreshness)
+			for k := range newUnresolvedEntries {
+				val := conCache.Lookups[k]
+				if !val.Resolved {
+					val.ExpiresAt = unresolvedExpiresAt
+					conCache.Lookups[k] = val
+				}
 			}
 		} else {
 			mctx.Warning("Unable to call Provider.LookupAll, returning only cached results: %s", err)
